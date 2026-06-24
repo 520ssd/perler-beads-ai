@@ -3,139 +3,29 @@ interface Env {
   VOLC_SECRET_ACCESS_KEY: string;
 }
 
-// 火山引擎API配置
 const VOLC_API_HOST = 'visual.volcengineapi.com';
 const VOLC_API_REGION = 'cn-north-1';
 const VOLC_API_SERVICE = 'cv';
 
 const encoder = new TextEncoder();
 
-// Uint8Array 转 hex 字符串
 function toHex(buf: Uint8Array): string {
   return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// HMAC-SHA256 (Web Crypto API)
 async function hmac(key: Uint8Array, data: string): Promise<Uint8Array> {
   const cryptoKey = await crypto.subtle.importKey(
-    'raw',
-    key,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
+    'raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
   );
   const sig = await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(data));
   return new Uint8Array(sig);
 }
 
-// SHA256 哈希 (Web Crypto API)
 async function sha256(data: string): Promise<string> {
   const hashBuf = await crypto.subtle.digest('SHA-256', encoder.encode(data));
   return toHex(new Uint8Array(hashBuf));
 }
 
-// 标准化URI编码（符合AWS SigV4规范）
-function uriEscape(str: string): string {
-  return encodeURIComponent(str)
-    .replace(/!/g, '%21')
-    .replace(/'/g, '%27')
-    .replace(/\(/g, '%28')
-    .replace(/\)/g, '%29')
-    .replace(/\*/g, '%2A');
-}
-
-// 查询参数转字符串（按AWS SigV4规范）
-function queryParamsToString(params: Record<string, string>): string {
-  const sortedKeys = Object.keys(params).sort();
-  return sortedKeys
-    .map((key) => {
-      const val = params[key];
-      if (typeof val === 'undefined' || val === null) {
-        return undefined;
-      }
-      return `${uriEscape(key)}=${uriEscape(val)}`;
-    })
-    .filter((v): v is string => v !== undefined)
-    .join('&');
-}
-
-// 获取签名headers
-function getSignHeaders(originHeaders: Record<string, string>): [string, string] {
-  function trimHeaderValue(header: string): string {
-    return header?.toString().trim().replace(/\s+/g, ' ') ?? '';
-  }
-
-  // 需要签名的header（小写）
-  const headersToSign = ['host', 'x-date', 'x-volc-content-sha256'];
-  
-  const signedHeaderKeys = headersToSign.sort().join(';');
-  
-  const canonicalHeaders = headersToSign
-    .sort()
-    .map((k) => {
-      const value = originHeaders[k] || originHeaders[k.toLowerCase()] || '';
-      return `${k}:${trimHeaderValue(value)}`;
-    })
-    .join('\n');
-
-  return [signedHeaderKeys, canonicalHeaders];
-}
-
-// 生成火山引擎V4标准签名
-async function generateSignature(
-  method: string,
-  pathName: string,
-  query: Record<string, string>,
-  headers: Record<string, string>,
-  bodySha: string,
-  accessKeyId: string,
-  secretAccessKey: string
-): Promise<string> {
-  const datetime = headers['X-Date'] || headers['x-date'];
-  
-  // X-Date格式: 20260624T101537Z，提取日期部分
-  const date = datetime.split('T')[0]; // 已经是 20260624
-
-  const [signedHeaders, canonicalHeaders] = getSignHeaders(headers);
-  
-  // 构建规范请求
-  const canonicalQueryString = queryParamsToString(query);
-  
-  const canonicalRequest = [
-    method.toUpperCase(),
-    pathName,
-    canonicalQueryString,
-    `${canonicalHeaders}\n`,
-    signedHeaders,
-    bodySha,
-  ].join('\n');
-
-  console.log('Canonical Request:', canonicalRequest);
-
-  const credentialScope = [date, VOLC_API_REGION, VOLC_API_SERVICE, 'request'].join('/');
-  const canonicalRequestHash = await sha256(canonicalRequest);
-  
-  const stringToSign = [
-    'VOLC4-HMAC-SHA256',
-    datetime,
-    credentialScope,
-    canonicalRequestHash,
-  ].join('\n');
-
-  console.log('String to Sign:', stringToSign);
-
-  // 计算签名密钥
-  const secretKey = encoder.encode(secretAccessKey);
-  const kDate = await hmac(secretKey, date);
-  const kRegion = await hmac(kDate, VOLC_API_REGION);
-  const kService = await hmac(kRegion, VOLC_API_SERVICE);
-  const kSigning = await hmac(kService, 'request');
-  const signature = toHex(await hmac(kSigning, stringToSign));
-
-  return `VOLC4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-}
-
-// 获取火山引擎要求的X-Date格式：YYYYMMDD'T'HHMMSS'Z'
 function getDateTimeNow(): string {
   const now = new Date();
   const year = now.getUTCFullYear();
@@ -144,224 +34,7 @@ function getDateTimeNow(): string {
   const hours = String(now.getUTCHours()).padStart(2, '0');
   const minutes = String(now.getUTCMinutes()).padStart(2, '0');
   const seconds = String(now.getUTCSeconds()).padStart(2, '0');
-  
   return `${year}${month}${day}T${hours}${minutes}${seconds}Z`;
-}
-
-// 底层提交任务（单次请求）
-async function submitTaskRaw(imageBase64: string, prompt: string, env: Env) {
-  const { VOLC_ACCESS_KEY_ID: accessKeyId, VOLC_SECRET_ACCESS_KEY: secretAccessKey } = env;
-
-  const base64Data = imageBase64.includes(',')
-    ? imageBase64.split(',')[1]
-    : imageBase64;
-
-  const requestBody = {
-    req_key: 'jimeng_t2i_v40',
-    binary_data_base64: [base64Data],
-    prompt: prompt,
-    scale: 0.5,
-    force_single: true,
-  };
-
-  const body = JSON.stringify(requestBody);
-  const bodySha = await sha256(body);
-
-  const query = {
-    Action: 'CVSync2AsyncSubmitTask',
-    Version: '2022-08-31'
-  };
-
-  // 生成时间戳
-  const xDate = getDateTimeNow();
-  console.log('Generated X-Date:', xDate);
-
-  const headers: Record<string, string> = {
-    'host': VOLC_API_HOST,
-    'X-Date': xDate,
-    'content-type': 'application/json',
-    'X-Volc-Content-Sha256': bodySha
-  };
-
-  const authorization = await generateSignature(
-    'POST',
-    '/',
-    query,
-    headers,
-    bodySha,
-    accessKeyId,
-    secretAccessKey
-  );
-
-  console.log('Authorization:', authorization);
-
-  const queryString = queryParamsToString(query);
-  const url = `https://${VOLC_API_HOST}/?${queryString}`;
-  console.log('Request URL:', url);
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Host': VOLC_API_HOST,
-      'X-Date': xDate,
-      'Content-Type': 'application/json',
-      'Authorization': authorization,
-      'X-Volc-Content-Sha256': bodySha
-    },
-    body: body
-  });
-
-  const responseText = await response.text();
-  console.log('Submit API Response:', response.status, responseText);
-
-  if (!response.ok) {
-    try {
-      const errorData = JSON.parse(responseText);
-      const errorMessage = errorData.ResponseMetadata?.Error?.Message || '';
-
-      if (errorMessage.includes('Risk')) {
-        throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
-      }
-      if (errorMessage.includes('InvalidTimestamp')) {
-        throw new Error('InvalidTimestamp');
-      }
-      if (errorMessage.includes('SignatureDoesNotMatch')) {
-        throw new Error('SignatureDoesNotMatch');
-      }
-    } catch (e) {
-      if (e instanceof Error && e.message !== 'SignatureDoesNotMatch') {
-        throw e;
-      }
-    }
-    throw new Error(`API request failed: ${response.status} ${responseText}`);
-  }
-
-  const data = JSON.parse(responseText);
-  if (data.ResponseMetadata?.Error) {
-    const errorMessage = data.ResponseMetadata.Error.Message || '';
-    
-    if (errorMessage.includes('Risk')) {
-      throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
-    }
-    if (errorMessage.includes('InvalidTimestamp')) {
-      throw new Error('InvalidTimestamp');
-    }
-    if (errorMessage.includes('SignatureDoesNotMatch')) {
-      throw new Error('SignatureDoesNotMatch');
-    }
-  }
-
-  return data;
-}
-
-// 包装函数：签名错误自动重试1次
-async function submitTask(imageBase64: string, prompt: string, env: Env, retryCount = 1) {
-  try {
-    return await submitTaskRaw(imageBase64, prompt, env);
-  } catch (err) {
-    const msg = (err as Error).message;
-    // 识别签名错误，重试一次
-    if ((msg === 'InvalidTimestamp' || msg === 'SignatureDoesNotMatch') && retryCount > 0) {
-      console.log(`检测到${msg}，等待2秒后自动重试...`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      return await submitTask(imageBase64, prompt, env, retryCount - 1);
-    }
-    throw err;
-  }
-}
-
-// 查询任务结果
-async function queryTask(taskId: string, env: Env) {
-  const { VOLC_ACCESS_KEY_ID: accessKeyId, VOLC_SECRET_ACCESS_KEY: secretAccessKey } = env;
-
-  const requestBody = {
-    req_key: 'jimeng_t2i_v40',
-    task_id: taskId
-  };
-
-  const body = JSON.stringify(requestBody);
-  const bodySha = await sha256(body);
-
-  const query = {
-    Action: 'CVSync2AsyncGetResult',
-    Version: '2022-08-31'
-  };
-
-  const xDate = getDateTimeNow();
-
-  const headers: Record<string, string> = {
-    'host': VOLC_API_HOST,
-    'X-Date': xDate,
-    'content-type': 'application/json',
-    'X-Volc-Content-Sha256': bodySha
-  };
-
-  const authorization = await generateSignature(
-    'POST',
-    '/',
-    query,
-    headers,
-    bodySha,
-    accessKeyId,
-    secretAccessKey
-  );
-
-  const queryString = queryParamsToString(query);
-  const response = await fetch(`https://${VOLC_API_HOST}/?${queryString}`, {
-    method: 'POST',
-    headers: {
-      'Host': VOLC_API_HOST,
-      'X-Date': xDate,
-      'Content-Type': 'application/json',
-      'Authorization': authorization,
-      'X-Volc-Content-Sha256': bodySha
-    },
-    body: body
-  });
-
-  const responseText = await response.text();
-  console.log('Query API Response:', response.status, responseText);
-
-  let data;
-  try {
-    data = JSON.parse(responseText);
-  } catch {
-    throw new Error(`API query failed: ${response.status} ${responseText}`);
-  }
-
-  if (!response.ok) {
-    throw new Error(`API query failed: ${response.status} ${responseText}`);
-  }
-
-  if (data.ResponseMetadata?.Error) {
-    throw new Error(`Query error: ${data.ResponseMetadata.Error.Message}`);
-  }
-
-  return data;
-}
-
-// 轮询等待任务完成
-async function waitForTaskCompletion(taskId: string, env: Env, maxAttempts = 60, intervalMs = 3000): Promise<string> {
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    console.log(`Polling attempt ${attempt + 1}/${maxAttempts}...`);
-    const result = await queryTask(taskId, env);
-
-    if (result.data && result.data.status === 'done') {
-      if (result.data.image_urls && result.data.image_urls.length > 0) {
-        return result.data.image_urls[0];
-      } else if (result.data.binary_data_base64 && result.data.binary_data_base64.length > 0) {
-        const base64Data = result.data.binary_data_base64[0];
-        return `data:image/jpeg;base64,${base64Data}`;
-      }
-      throw new Error('Task completed but no image data returned');
-    } else if (result.data && result.data.status === 'failed') {
-      throw new Error(`Task failed: ${result.message || 'Unknown error'}`);
-    }
-
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
-  }
-
-  throw new Error('Task timeout: exceeded maximum polling attempts');
 }
 
 export const onRequestPost: PagesFunction<Env> = async (context) => {
@@ -369,55 +42,127 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     const { request, env } = context;
     const { imageBase64, prompt } = await request.json();
 
-    if (!imageBase64) {
-      return Response.json(
-        { error: 'Missing imageBase64 parameter' },
-        { status: 400 }
-      );
+    if (!imageBase64 || !prompt) {
+      return Response.json({ error: 'Missing parameters' }, { status: 400 });
     }
 
-    if (!prompt) {
-      return Response.json(
-        { error: 'Missing prompt parameter' },
-        { status: 400 }
-      );
-    }
+    // 调试：检查密钥格式
+    console.log('AK length:', env.VOLC_ACCESS_KEY_ID?.length);
+    console.log('SK length:', env.VOLC_SECRET_ACCESS_KEY?.length);
+    console.log('AK first/last char:', env.VOLC_ACCESS_KEY_ID?.[0], env.VOLC_ACCESS_KEY_ID?.slice(-1));
+    console.log('SK contains newline:', env.VOLC_SECRET_ACCESS_KEY?.includes('\n'));
+    console.log('SK contains space:', env.VOLC_SECRET_ACCESS_KEY?.includes(' '));
 
-    if (!env.VOLC_ACCESS_KEY_ID || !env.VOLC_SECRET_ACCESS_KEY) {
-      return Response.json({ error: "VOLC 环境变量未完整配置" }, { status: 500 });
-    }
+    const base64Data = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
+    const requestBody = JSON.stringify({
+      req_key: 'jimeng_t2i_v40',
+      binary_data_base64: [base64Data],
+      prompt: prompt,
+      scale: 0.5,
+      force_single: true,
+    });
 
-    console.log('Submitting AI optimization task...');
-    console.log('Current UTC time:', new Date().toISOString());
+    const bodyHash = await sha256(requestBody);
+    const xDate = getDateTimeNow();
+    const date = xDate.split('T')[0];
+
+    // 构建规范请求 - 注意换行符位置
+    const canonicalQueryString = 'Action=CVSync2AsyncSubmitTask&Version=2022-08-31';
     
-    // 使用带签名错误重试的包装函数
-    const submitResult = await submitTask(imageBase64, prompt, env);
+    // 注意：canonicalHeaders 最后没有额外的换行符
+    const canonicalHeaders = [
+      `host:${VOLC_API_HOST}`,
+      `x-date:${xDate}`,
+      `x-volc-content-sha256:${bodyHash}`
+    ].join('\n');
+    
+    const signedHeaders = 'host;x-date;x-volc-content-sha256';
+    
+    const canonicalRequest = [
+      'POST',
+      '/',
+      canonicalQueryString,
+      canonicalHeaders + '\n',  // 关键：headers后面需要两个换行
+      signedHeaders,
+      bodyHash
+    ].join('\n');
 
-    if (!submitResult.data || !submitResult.data.task_id) {
-      return Response.json(
-        { error: 'Failed to submit task', details: submitResult },
-        { status: 500 }
-      );
-    }
+    console.log('=== CANONICAL REQUEST ===');
+    console.log(canonicalRequest);
+    console.log('=== END CANONICAL REQUEST ===');
 
-    const taskId = submitResult.data.task_id;
-    console.log('Task submitted, ID:', taskId);
+    const canonicalRequestHash = await sha256(canonicalRequest);
+    console.log('Canonical Request Hash:', canonicalRequestHash);
 
-    const imageUrl = await waitForTaskCompletion(taskId, env);
+    const credentialScope = `${date}/${VOLC_API_REGION}/${VOLC_API_SERVICE}/request`;
+    const stringToSign = [
+      'VOLC4-HMAC-SHA256',
+      xDate,
+      credentialScope,
+      canonicalRequestHash
+    ].join('\n');
+
+    console.log('=== STRING TO SIGN ===');
+    console.log(stringToSign);
+    console.log('=== END STRING TO SIGN ===');
+
+    // 计算签名密钥
+    const kSecret = encoder.encode(env.VOLC_SECRET_ACCESS_KEY);
+    const kDate = await hmac(kSecret, date);
+    console.log('kDate:', toHex(kDate));
+    
+    const kRegion = await hmac(kDate, VOLC_API_REGION);
+    console.log('kRegion:', toHex(kRegion));
+    
+    const kService = await hmac(kRegion, VOLC_API_SERVICE);
+    console.log('kService:', toHex(kService));
+    
+    const kSigning = await hmac(kService, 'request');
+    console.log('kSigning:', toHex(kSigning));
+    
+    const signature = toHex(await hmac(kSigning, stringToSign));
+    console.log('Signature:', signature);
+
+    const authorization = `VOLC4-HMAC-SHA256 Credential=${env.VOLC_ACCESS_KEY_ID}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+    console.log('Authorization:', authorization);
+
+    // 发送请求
+    const response = await fetch(
+      `https://${VOLC_API_HOST}/?${canonicalQueryString}`,
+      {
+        method: 'POST',
+        headers: {
+          'Host': VOLC_API_HOST,
+          'X-Date': xDate,
+          'Content-Type': 'application/json',
+          'Authorization': authorization,
+          'X-Volc-Content-Sha256': bodyHash,
+        },
+        body: requestBody,
+      }
+    );
+
+    const responseText = await response.text();
+    console.log('Response:', response.status, responseText);
 
     return Response.json({
-      success: true,
-      imageUrl: imageUrl,
-      taskId: taskId
+      success: response.ok,
+      debug: {
+        xDate,
+        bodyHash,
+        canonicalRequest,
+        stringToSign,
+        signature,
+        authorization,
+        responseStatus: response.status,
+        responseText: responseText.substring(0, 500)
+      }
     });
 
   } catch (error) {
-    console.error('AI optimization error:', error);
+    console.error('Error:', error);
     return Response.json(
-      {
-        error: 'AI optimization failed',
-        message: error instanceof Error ? error.message : 'Unknown error'
-      },
+      { error: 'Failed', message: error instanceof Error ? error.message : 'Unknown' },
       { status: 500 }
     );
   }

@@ -1,29 +1,26 @@
-export const onRequestPost = async (context) => {
+export const onRequestPost = async ({ request, env }) => {
   try {
-    const { request, env } = context;
     const body = await request.json();
     const { imageBase64, prompt } = body;
 
-    // 验证参数
-    if (!imageBase64 || !prompt) {
-      return new Response(JSON.stringify({ error: 'Missing parameters' }), {
+    if (!prompt) {
+      return new Response(JSON.stringify({ error: '缺少 prompt 参数' }), {
         status: 400,
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
 
-    // 验证密钥
     const ak = env.VOLC_ACCESS_KEY_ID;
     const sk = env.VOLC_SECRET_ACCESS_KEY;
+
     if (!ak || !sk) {
-      return new Response(JSON.stringify({ error: 'Missing credentials' }), {
+      return new Response(JSON.stringify({ error: '未配置密钥' }), {
         status: 500,
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
 
-    // 准备请求体
-    const cleanBase64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
+    const cleanBase64 = imageBase64?.includes(',') ? imageBase64.split(',')[1] : (imageBase64 || '');
     const requestBody = JSON.stringify({
       req_key: 'jimeng_t2i_v40',
       binary_data_base64: [cleanBase64],
@@ -32,57 +29,32 @@ export const onRequestPost = async (context) => {
       force_single: true,
     });
 
-    // 生成时间戳
     const now = new Date();
-    const year = now.getUTCFullYear();
-    const month = String(now.getUTCMonth() + 1).padStart(2, '0');
-    const day = String(now.getUTCDate()).padStart(2, '0');
-    const hours = String(now.getUTCHours()).padStart(2, '0');
-    const minutes = String(now.getUTCMinutes()).padStart(2, '0');
-    const seconds = String(now.getUTCSeconds()).padStart(2, '0');
-    const xDate = year + month + day + 'T' + hours + minutes + seconds + 'Z';
-    const dateShort = year + month + day;
+    const pad = (n) => String(n).padStart(2, '0');
+    const xDate = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}T${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}Z`;
+    const dateShort = xDate.substring(0, 8);
 
-    // 计算 body hash
     const encoder = new TextEncoder();
-    const bodyBytes = encoder.encode(requestBody);
-    const bodyHashBuffer = await crypto.subtle.digest('SHA-256', bodyBytes);
-    const bodyHash = Array.from(new Uint8Array(bodyHashBuffer))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
 
-    // 构建规范请求
+    const bodyHashBuf = await crypto.subtle.digest('SHA-256', encoder.encode(requestBody));
+    const bodyHash = Array.from(new Uint8Array(bodyHashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+
     const canonicalQuery = 'Action=CVSync2AsyncSubmitTask&Version=2022-08-31';
-    const canonicalHeaders = 'host:visual.volcengineapi.com\nx-date:' + xDate + '\nx-volc-content-sha256:' + bodyHash + '\n';
+    const canonicalHeaders = `host:visual.volcengineapi.com\nx-date:${xDate}\nx-volc-content-sha256:${bodyHash}\n`;
     const signedHeaders = 'host;x-date;x-volc-content-sha256';
-    const canonicalRequest = 'POST\n/\n' + canonicalQuery + '\n' + canonicalHeaders + '\n' + signedHeaders + '\n' + bodyHash;
+    const canonicalRequest = `POST\n/\n${canonicalQuery}\n${canonicalHeaders}\n${signedHeaders}\n${bodyHash}`;
 
-    // 计算 canonical request hash
-    const crBytes = encoder.encode(canonicalRequest);
-    const crHashBuffer = await crypto.subtle.digest('SHA-256', crBytes);
-    const crHash = Array.from(new Uint8Array(crHashBuffer))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
+    const crHashBuf = await crypto.subtle.digest('SHA-256', encoder.encode(canonicalRequest));
+    const crHash = Array.from(new Uint8Array(crHashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
 
-    // 构建待签名字符串
-    const credentialScope = dateShort + '/cn-north-1/cv/request';
-    const stringToSign = 'VOLC4-HMAC-SHA256\n' + xDate + '\n' + credentialScope + '\n' + crHash;
+    const credentialScope = `${dateShort}/cn-north-1/cv/request`;
+    const stringToSign = `VOLC4-HMAC-SHA256\n${xDate}\n${credentialScope}\n${crHash}`;
 
-    // 计算签名密钥
     async function hmacSign(key, data) {
-      const cryptoKey = await crypto.subtle.importKey(
-        'raw',
-        typeof key === 'string' ? encoder.encode(key) : key,
-        { name: 'HMAC', hash: 'SHA-256' },
-        false,
-        ['sign']
-      );
-      const signature = await crypto.subtle.sign('HMAC', cryptoKey, typeof data === 'string' ? encoder.encode(data) : data);
-      return new Uint8Array(signature);
-    }
-
-    function bytesToHex(bytes) {
-      return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+      const keyData = typeof key === 'string' ? encoder.encode(key) : key;
+      const cryptoKey = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      const sig = await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(data));
+      return new Uint8Array(sig);
     }
 
     const kDate = await hmacSign(sk, dateShort);
@@ -90,15 +62,12 @@ export const onRequestPost = async (context) => {
     const kService = await hmacSign(kRegion, 'cv');
     const kSigning = await hmacSign(kService, 'request');
 
-    // 计算签名
-    const signatureBytes = await hmacSign(kSigning, stringToSign);
-    const signature = bytesToHex(signatureBytes);
+    const sigBytes = await hmacSign(kSigning, stringToSign);
+    const signature = Array.from(sigBytes).map(b => b.toString(16).padStart(2, '0')).join('');
 
-    // 构建 Authorization
-    const authorization = 'VOLC4-HMAC-SHA256 Credential=' + ak + '/' + credentialScope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature;
+    const authorization = `VOLC4-HMAC-SHA256 Credential=${ak}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
-    // 发送请求
-    const response = await fetch('https://visual.volcengineapi.com/?Action=CVSync2AsyncSubmitTask&Version=2022-08-31', {
+    const response = await fetch(`https://visual.volcengineapi.com/?${canonicalQuery}`, {
       method: 'POST',
       headers: {
         'Host': 'visual.volcengineapi.com',
@@ -110,30 +79,17 @@ export const onRequestPost = async (context) => {
       body: requestBody,
     });
 
-    const responseText = await response.text();
-    
-    return new Response(JSON.stringify({
-      status: response.status,
-      response: JSON.parse(responseText),
-      debug: {
-        xDate,
-        bodyHash,
-        canonicalRequest,
-        stringToSign,
-        signature,
-        authorization
-      }
-    }), {
+    const result = await response.json();
+
+    return new Response(JSON.stringify(result), {
       status: 200,
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
     });
 
   } catch (error) {
-    return new Response(JSON.stringify({
-      error: error.message || 'Unknown error'
-    }), {
+    return new Response(JSON.stringify({ error: error.message }), {
       status: 500,
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
     });
   }
 };

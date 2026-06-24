@@ -134,9 +134,17 @@ async function generateSignature(
   return `VOLC4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 }
 
-// 获取标准UTC ISO时间（不做任何裁剪）
+// 获取火山引擎要求的X-Date格式：YYYYMMDD'T'HHMMSS'Z'
 function getDateTimeNow(): string {
-  return new Date().toISOString();
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(now.getUTCDate()).padStart(2, '0');
+  const hours = String(now.getUTCHours()).padStart(2, '0');
+  const minutes = String(now.getUTCMinutes()).padStart(2, '0');
+  const seconds = String(now.getUTCSeconds()).padStart(2, '0');
+  
+  return `${year}${month}${day}T${hours}${minutes}${seconds}Z`;
 }
 
 // 底层提交任务（单次请求）
@@ -165,6 +173,7 @@ async function submitTaskRaw(imageBase64: string, prompt: string, env: Env) {
 
   // 全局只生成一次时间戳，全程复用，避免时差过期
   const xDate = getDateTimeNow();
+  console.log('Generated X-Date:', xDate);
 
   const headers: Record<string, string> = {
     'host': VOLC_API_HOST,
@@ -240,8 +249,8 @@ async function submitTask(imageBase64: string, prompt: string, env: Env, retryCo
     const msg = (err as Error).message;
     // 识别时间戳过期，重试一次
     if (msg === 'InvalidTimestamp' && retryCount > 0) {
-      console.log('检测到签名过期，等待1秒后自动重试');
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      console.log('检测到签名过期，等待2秒后自动重试...');
+      await new Promise(resolve => setTimeout(resolve, 2000));
       return await submitTask(imageBase64, prompt, env, retryCount - 1);
     }
     throw err;
@@ -266,6 +275,7 @@ async function queryTask(taskId: string, env: Env) {
   };
 
   const xDate = getDateTimeNow();
+  console.log('Query X-Date:', xDate);
 
   const headers: Record<string, string> = {
     'host': VOLC_API_HOST,
@@ -383,6 +393,8 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     }
 
     console.log('Submitting AI optimization task...');
+    console.log('Current UTC time:', new Date().toISOString());
+    
     // 使用带过期重试的包装函数
     const submitResult = await submitTask(imageBase64, prompt, env);
 

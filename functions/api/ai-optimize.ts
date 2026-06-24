@@ -7,163 +7,146 @@ const VOLC_API_HOST = 'visual.volcengineapi.com';
 const VOLC_API_REGION = 'cn-north-1';
 const VOLC_API_SERVICE = 'cv';
 
-const encoder = new TextEncoder();
-
 function toHex(buf: Uint8Array): string {
   return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function hmac(key: Uint8Array, data: string): Promise<Uint8Array> {
+async function hmac(key: ArrayBuffer, data: string): Promise<ArrayBuffer> {
   const cryptoKey = await crypto.subtle.importKey(
     'raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
   );
-  const sig = await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(data));
-  return new Uint8Array(sig);
+  return await crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(data));
 }
 
 async function sha256(data: string): Promise<string> {
-  const hashBuf = await crypto.subtle.digest('SHA-256', encoder.encode(data));
+  const hashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
   return toHex(new Uint8Array(hashBuf));
 }
 
-function getDateTimeNow(): string {
-  const now = new Date();
-  const year = now.getUTCFullYear();
-  const month = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(now.getUTCDate()).padStart(2, '0');
-  const hours = String(now.getUTCHours()).padStart(2, '0');
-  const minutes = String(now.getUTCMinutes()).padStart(2, '0');
-  const seconds = String(now.getUTCSeconds()).padStart(2, '0');
-  return `${year}${month}${day}T${hours}${minutes}${seconds}Z`;
+function getXDate(): string {
+  const d = new Date();
+  return [
+    d.getUTCFullYear(),
+    String(d.getUTCMonth() + 1).padStart(2, '0'),
+    String(d.getUTCDate()).padStart(2, '0'),
+    'T',
+    String(d.getUTCHours()).padStart(2, '0'),
+    String(d.getUTCMinutes()).padStart(2, '0'),
+    String(d.getUTCSeconds()).padStart(2, '0'),
+    'Z'
+  ].join('');
 }
 
 export const onRequestPost: PagesFunction<Env> = async (context) => {
   try {
     const { request, env } = context;
-    const { imageBase64, prompt } = await request.json();
-
-    if (!imageBase64 || !prompt) {
-      return Response.json({ error: 'Missing parameters' }, { status: 400 });
+    
+    // 验证环境变量
+    if (!env.VOLC_ACCESS_KEY_ID || !env.VOLC_SECRET_ACCESS_KEY) {
+      return new Response(JSON.stringify({ error: 'Missing credentials' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
-    // 调试：检查密钥格式
-    console.log('AK length:', env.VOLC_ACCESS_KEY_ID?.length);
-    console.log('SK length:', env.VOLC_SECRET_ACCESS_KEY?.length);
-    console.log('AK first/last char:', env.VOLC_ACCESS_KEY_ID?.[0], env.VOLC_ACCESS_KEY_ID?.slice(-1));
-    console.log('SK contains newline:', env.VOLC_SECRET_ACCESS_KEY?.includes('\n'));
-    console.log('SK contains space:', env.VOLC_SECRET_ACCESS_KEY?.includes(' '));
+    // 解析请求
+    const body = await request.json();
+    const { imageBase64, prompt } = body;
 
-    const base64Data = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
-    const requestBody = JSON.stringify({
+    if (!imageBase64 || !prompt) {
+      return new Response(JSON.stringify({ error: 'Missing imageBase64 or prompt' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 清理 base64
+    const cleanBase64 = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
+
+    // 请求体
+    const requestBodyStr = JSON.stringify({
       req_key: 'jimeng_t2i_v40',
-      binary_data_base64: [base64Data],
+      binary_data_base64: [cleanBase64],
       prompt: prompt,
       scale: 0.5,
       force_single: true,
     });
 
-    const bodyHash = await sha256(requestBody);
-    const xDate = getDateTimeNow();
-    const date = xDate.split('T')[0];
+    // 计算哈希
+    const bodyHash = await sha256(requestBodyStr);
+    const xDate = getXDate();
+    const dateShort = xDate.substring(0, 8); // YYYYMMDD
 
-    // 构建规范请求 - 注意换行符位置
-    const canonicalQueryString = 'Action=CVSync2AsyncSubmitTask&Version=2022-08-31';
-    
-    // 注意：canonicalHeaders 最后没有额外的换行符
-    const canonicalHeaders = [
-      `host:${VOLC_API_HOST}`,
-      `x-date:${xDate}`,
-      `x-volc-content-sha256:${bodyHash}`
-    ].join('\n');
-    
+    // 构建规范请求
+    const canonicalQuery = 'Action=CVSync2AsyncSubmitTask&Version=2022-08-31';
+    const canonicalHeaders = `host:${VOLC_API_HOST}\nx-date:${xDate}\nx-volc-content-sha256:${bodyHash}\n`;
     const signedHeaders = 'host;x-date;x-volc-content-sha256';
-    
-    const canonicalRequest = [
-      'POST',
-      '/',
-      canonicalQueryString,
-      canonicalHeaders + '\n',  // 关键：headers后面需要两个换行
-      signedHeaders,
-      bodyHash
-    ].join('\n');
 
-    console.log('=== CANONICAL REQUEST ===');
-    console.log(canonicalRequest);
-    console.log('=== END CANONICAL REQUEST ===');
+    const canonicalRequest = `POST\n/\n${canonicalQuery}\n${canonicalHeaders}\n${signedHeaders}\n${bodyHash}`;
 
-    const canonicalRequestHash = await sha256(canonicalRequest);
-    console.log('Canonical Request Hash:', canonicalRequestHash);
-
-    const credentialScope = `${date}/${VOLC_API_REGION}/${VOLC_API_SERVICE}/request`;
-    const stringToSign = [
-      'VOLC4-HMAC-SHA256',
-      xDate,
-      credentialScope,
-      canonicalRequestHash
-    ].join('\n');
-
-    console.log('=== STRING TO SIGN ===');
-    console.log(stringToSign);
-    console.log('=== END STRING TO SIGN ===');
+    // 构建待签名字符串
+    const credentialScope = `${dateShort}/${VOLC_API_REGION}/${VOLC_API_SERVICE}/request`;
+    const stringToSign = `VOLC4-HMAC-SHA256\n${xDate}\n${credentialScope}\n${await sha256(canonicalRequest)}`;
 
     // 计算签名密钥
-    const kSecret = encoder.encode(env.VOLC_SECRET_ACCESS_KEY);
-    const kDate = await hmac(kSecret, date);
-    console.log('kDate:', toHex(kDate));
-    
+    const secretKey = new TextEncoder().encode(env.VOLC_SECRET_ACCESS_KEY);
+    const kDate = await hmac(secretKey, dateShort);
     const kRegion = await hmac(kDate, VOLC_API_REGION);
-    console.log('kRegion:', toHex(kRegion));
-    
     const kService = await hmac(kRegion, VOLC_API_SERVICE);
-    console.log('kService:', toHex(kService));
-    
     const kSigning = await hmac(kService, 'request');
-    console.log('kSigning:', toHex(kSigning));
-    
-    const signature = toHex(await hmac(kSigning, stringToSign));
-    console.log('Signature:', signature);
 
+    // 计算签名
+    const signature = toHex(new Uint8Array(await hmac(kSigning, stringToSign)));
+
+    // 构建 Authorization
     const authorization = `VOLC4-HMAC-SHA256 Credential=${env.VOLC_ACCESS_KEY_ID}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-    console.log('Authorization:', authorization);
 
-    // 发送请求
-    const response = await fetch(
-      `https://${VOLC_API_HOST}/?${canonicalQueryString}`,
-      {
-        method: 'POST',
-        headers: {
-          'Host': VOLC_API_HOST,
-          'X-Date': xDate,
-          'Content-Type': 'application/json',
-          'Authorization': authorization,
-          'X-Volc-Content-Sha256': bodyHash,
-        },
-        body: requestBody,
-      }
-    );
+    // 发送请求到火山引擎
+    const apiUrl = `https://${VOLC_API_HOST}/?${canonicalQuery}`;
+    
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Host': VOLC_API_HOST,
+        'X-Date': xDate,
+        'Content-Type': 'application/json',
+        'Authorization': authorization,
+        'X-Volc-Content-Sha256': bodyHash,
+      },
+      body: requestBodyStr,
+    });
 
     const responseText = await response.text();
-    console.log('Response:', response.status, responseText);
+    const responseData = JSON.parse(responseText);
 
-    return Response.json({
-      success: response.ok,
+    // 返回结果（包含调试信息）
+    return new Response(JSON.stringify({
+      success: response.ok && !responseData.ResponseMetadata?.Error,
+      data: responseData,
       debug: {
         xDate,
+        dateShort,
         bodyHash,
         canonicalRequest,
         stringToSign,
         signature,
         authorization,
-        responseStatus: response.status,
-        responseText: responseText.substring(0, 500)
+        apiUrl,
       }
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
     });
 
   } catch (error) {
     console.error('Error:', error);
-    return Response.json(
-      { error: 'Failed', message: error instanceof Error ? error.message : 'Unknown' },
-      { status: 500 }
-    );
+    return new Response(JSON.stringify({
+      error: 'Failed',
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 };

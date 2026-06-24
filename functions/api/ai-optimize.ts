@@ -96,7 +96,7 @@ function getSignHeaders(originHeaders: Record<string, string>, needSignHeaders?:
   return [signedHeaderKeys, canonicalHeaders];
 }
 
-// 生成火山引擎V4标准签名【核心修复函数】
+// 生成火山引擎V4标准签名
 async function generateSignature(
   method: string,
   pathName: string,
@@ -107,7 +107,6 @@ async function generateSignature(
   secretAccessKey: string
 ): Promise<string> {
   const datetime = headers['X-Date'] || headers['x-date'];
-  // 仅提取日期 YYYYMMDD
   const date = datetime.split('T')[0].replace(/-/g, '');
 
   const [signedHeaders, canonicalHeaders] = getSignHeaders(headers);
@@ -123,7 +122,6 @@ async function generateSignature(
 
   const credentialScope = [date, VOLC_API_REGION, VOLC_API_SERVICE, 'request'].join('/');
   const canonicalRequestHash = await sha256(canonicalRequest);
-  // 标准V4前缀 VOLC4-HMAC-SHA256
   const stringToSign = ['VOLC4-HMAC-SHA256', datetime, credentialScope, canonicalRequestHash].join('\n');
 
   const secretKey = encoder.encode(secretAccessKey);
@@ -133,17 +131,16 @@ async function generateSignature(
   const kSigning = await hmac(kService, 'request');
   const signature = toHex(await hmac(kSigning, stringToSign));
 
-  // 修复：删除字段末尾多余逗号，标准鉴权格式
   return `VOLC4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 }
 
-// 获取当前标准UTC ISO时间【修复：不再裁剪时间戳】
+// 获取标准UTC ISO时间（不做任何裁剪）
 function getDateTimeNow(): string {
   return new Date().toISOString();
 }
 
-// 提交任务到即梦AI
-async function submitTask(imageBase64: string, prompt: string, env: Env) {
+// 底层提交任务（单次请求）
+async function submitTaskRaw(imageBase64: string, prompt: string, env: Env) {
   const { VOLC_ACCESS_KEY_ID: accessKeyId, VOLC_SECRET_ACCESS_KEY: secretAccessKey } = env;
 
   const base64Data = imageBase64.includes(',')
@@ -166,9 +163,9 @@ async function submitTask(imageBase64: string, prompt: string, env: Env) {
     Version: '2022-08-31'
   };
 
+  // 全局只生成一次时间戳，全程复用，避免时差过期
   const xDate = getDateTimeNow();
 
-  // 修复：增加强制校验头 X-Volc-Content-Sha256
   const headers: Record<string, string> = {
     'host': VOLC_API_HOST,
     'X-Date': xDate,
@@ -209,6 +206,10 @@ async function submitTask(imageBase64: string, prompt: string, env: Env) {
       if (errorCode === 50411 || errorMessage.includes('Risk')) {
         throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
       }
+      // 抛出签名过期标记
+      if (errorMessage.includes('InvalidTimestamp')) {
+        throw new Error('InvalidTimestamp');
+      }
     } catch {
       // 解析失败，使用原始错误
     }
@@ -223,9 +224,28 @@ async function submitTask(imageBase64: string, prompt: string, env: Env) {
     if (errorCode === 50411 || errorMessage.includes('Risk')) {
       throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
     }
+    if (errorMessage.includes('InvalidTimestamp')) {
+      throw new Error('InvalidTimestamp');
+    }
   }
 
   return data;
+}
+
+// 包装函数：签名过期自动重试1次
+async function submitTask(imageBase64: string, prompt: string, env: Env, retryCount = 1) {
+  try {
+    return await submitTaskRaw(imageBase64, prompt, env);
+  } catch (err) {
+    const msg = (err as Error).message;
+    // 识别时间戳过期，重试一次
+    if (msg === 'InvalidTimestamp' && retryCount > 0) {
+      console.log('检测到签名过期，等待1秒后自动重试');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return await submitTask(imageBase64, prompt, env, retryCount - 1);
+    }
+    throw err;
+  }
 }
 
 // 查询任务结果
@@ -247,7 +267,6 @@ async function queryTask(taskId: string, env: Env) {
 
   const xDate = getDateTimeNow();
 
-  // 修复：增加强制校验头 X-Volc-Content-Sha256
   const headers: Record<string, string> = {
     'host': VOLC_API_HOST,
     'X-Date': xDate,
@@ -359,12 +378,12 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       );
     }
 
-    // 前置校验环境变量，防止空密钥HMAC报错
     if (!env.VOLC_ACCESS_KEY_ID || !env.VOLC_SECRET_ACCESS_KEY) {
       return Response.json({ error: "VOLC 环境变量未完整配置" }, { status: 500 });
     }
 
     console.log('Submitting AI optimization task...');
+    // 使用带过期重试的包装函数
     const submitResult = await submitTask(imageBase64, prompt, env);
 
     if (!submitResult.data || !submitResult.data.task_id) {

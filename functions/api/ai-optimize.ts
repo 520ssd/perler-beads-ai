@@ -10,14 +10,6 @@ const VOLC_API_SERVICE = 'cv';
 
 const encoder = new TextEncoder();
 
-// 需要忽略的headers
-const HEADER_KEYS_TO_IGNORE = new Set([
-  'authorization',
-  'content-length',
-  'content-type',
-  'user-agent',
-]);
-
 // Uint8Array 转 hex 字符串
 function toHex(buf: Uint8Array): string {
   return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -42,57 +34,50 @@ async function sha256(data: string): Promise<string> {
   return toHex(new Uint8Array(hashBuf));
 }
 
-// URI编码函数
+// 标准化URI编码（符合AWS SigV4规范）
 function uriEscape(str: string): string {
-  try {
-    return encodeURIComponent(str)
-      .replace(/[^A-Za-z0-9_.~\-%]+/g, (c) => c)
-      .replace(/[*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
-  } catch (e) {
-    return '';
-  }
+  return encodeURIComponent(str)
+    .replace(/!/g, '%21')
+    .replace(/'/g, '%27')
+    .replace(/\(/g, '%28')
+    .replace(/\)/g, '%29')
+    .replace(/\*/g, '%2A');
 }
 
-// 查询参数转字符串
+// 查询参数转字符串（按AWS SigV4规范）
 function queryParamsToString(params: Record<string, string>): string {
-  return Object.keys(params)
-    .sort()
+  const sortedKeys = Object.keys(params).sort();
+  return sortedKeys
     .map((key) => {
       const val = params[key];
       if (typeof val === 'undefined' || val === null) {
         return undefined;
       }
-      const escapedKey = uriEscape(key);
-      if (!escapedKey) {
-        return undefined;
-      }
-      return `${escapedKey}=${uriEscape(val)}`;
+      return `${uriEscape(key)}=${uriEscape(val)}`;
     })
     .filter((v): v is string => v !== undefined)
     .join('&');
 }
 
 // 获取签名headers
-function getSignHeaders(originHeaders: Record<string, string>, needSignHeaders?: string[]): [string, string] {
+function getSignHeaders(originHeaders: Record<string, string>): [string, string] {
   function trimHeaderValue(header: string): string {
     return header?.toString().trim().replace(/\s+/g, ' ') ?? '';
   }
 
-  let h = Object.keys(originHeaders);
-  if (Array.isArray(needSignHeaders)) {
-    const needSignSet = new Set([...needSignHeaders, 'x-date', 'host'].map((k) => k.toLowerCase()));
-    h = h.filter((k) => needSignSet.has(k.toLowerCase()));
-  }
-  h = h.filter((k) => !HEADER_KEYS_TO_IGNORE.has(k.toLowerCase()));
-  const signedHeaderKeys = h
-    .slice()
-    .map((k) => k.toLowerCase())
+  // 需要签名的header（小写）
+  const headersToSign = ['host', 'x-date', 'x-volc-content-sha256'];
+  
+  const signedHeaderKeys = headersToSign.sort().join(';');
+  
+  const canonicalHeaders = headersToSign
     .sort()
-    .join(';');
-  const canonicalHeaders = h
-    .sort((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1))
-    .map((k) => `${k.toLowerCase()}:${trimHeaderValue(originHeaders[k])}`)
+    .map((k) => {
+      const value = originHeaders[k] || originHeaders[k.toLowerCase()] || '';
+      return `${k}:${trimHeaderValue(value)}`;
+    })
     .join('\n');
+
   return [signedHeaderKeys, canonicalHeaders];
 }
 
@@ -107,23 +92,39 @@ async function generateSignature(
   secretAccessKey: string
 ): Promise<string> {
   const datetime = headers['X-Date'] || headers['x-date'];
-  const date = datetime.split('T')[0].replace(/-/g, '');
+  
+  // X-Date格式: 20260624T101537Z，提取日期部分
+  const date = datetime.split('T')[0]; // 已经是 20260624
 
   const [signedHeaders, canonicalHeaders] = getSignHeaders(headers);
-  const emptyBodyHash = await sha256('');
+  
+  // 构建规范请求
+  const canonicalQueryString = queryParamsToString(query);
+  
   const canonicalRequest = [
     method.toUpperCase(),
     pathName,
-    queryParamsToString(query) || '',
+    canonicalQueryString,
     `${canonicalHeaders}\n`,
     signedHeaders,
-    bodySha || emptyBodyHash,
+    bodySha,
   ].join('\n');
+
+  console.log('Canonical Request:', canonicalRequest);
 
   const credentialScope = [date, VOLC_API_REGION, VOLC_API_SERVICE, 'request'].join('/');
   const canonicalRequestHash = await sha256(canonicalRequest);
-  const stringToSign = ['VOLC4-HMAC-SHA256', datetime, credentialScope, canonicalRequestHash].join('\n');
+  
+  const stringToSign = [
+    'VOLC4-HMAC-SHA256',
+    datetime,
+    credentialScope,
+    canonicalRequestHash,
+  ].join('\n');
 
+  console.log('String to Sign:', stringToSign);
+
+  // 计算签名密钥
   const secretKey = encoder.encode(secretAccessKey);
   const kDate = await hmac(secretKey, date);
   const kRegion = await hmac(kDate, VOLC_API_REGION);
@@ -171,7 +172,7 @@ async function submitTaskRaw(imageBase64: string, prompt: string, env: Env) {
     Version: '2022-08-31'
   };
 
-  // 全局只生成一次时间戳，全程复用，避免时差过期
+  // 生成时间戳
   const xDate = getDateTimeNow();
   console.log('Generated X-Date:', xDate);
 
@@ -192,13 +193,20 @@ async function submitTaskRaw(imageBase64: string, prompt: string, env: Env) {
     secretAccessKey
   );
 
+  console.log('Authorization:', authorization);
+
   const queryString = queryParamsToString(query);
-  const response = await fetch(`https://${VOLC_API_HOST}/?${queryString}`, {
+  const url = `https://${VOLC_API_HOST}/?${queryString}`;
+  console.log('Request URL:', url);
+
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
-      ...headers,
+      'Host': VOLC_API_HOST,
+      'X-Date': xDate,
+      'Content-Type': 'application/json',
       'Authorization': authorization,
-      'Content-Length': encoder.encode(body).length.toString()
+      'X-Volc-Content-Sha256': bodySha
     },
     body: body
   });
@@ -209,47 +217,52 @@ async function submitTaskRaw(imageBase64: string, prompt: string, env: Env) {
   if (!response.ok) {
     try {
       const errorData = JSON.parse(responseText);
-      const errorCode = errorData.status || errorData.code;
-      const errorMessage = errorData.message || '';
+      const errorMessage = errorData.ResponseMetadata?.Error?.Message || '';
 
-      if (errorCode === 50411 || errorMessage.includes('Risk')) {
+      if (errorMessage.includes('Risk')) {
         throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
       }
-      // 抛出签名过期标记
       if (errorMessage.includes('InvalidTimestamp')) {
         throw new Error('InvalidTimestamp');
       }
-    } catch {
-      // 解析失败，使用原始错误
+      if (errorMessage.includes('SignatureDoesNotMatch')) {
+        throw new Error('SignatureDoesNotMatch');
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message !== 'SignatureDoesNotMatch') {
+        throw e;
+      }
     }
     throw new Error(`API request failed: ${response.status} ${responseText}`);
   }
 
   const data = JSON.parse(responseText);
-  if (data.status && data.status !== 10000) {
-    const errorCode = data.status;
-    const errorMessage = data.message || '';
-
-    if (errorCode === 50411 || errorMessage.includes('Risk')) {
+  if (data.ResponseMetadata?.Error) {
+    const errorMessage = data.ResponseMetadata.Error.Message || '';
+    
+    if (errorMessage.includes('Risk')) {
       throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
     }
     if (errorMessage.includes('InvalidTimestamp')) {
       throw new Error('InvalidTimestamp');
+    }
+    if (errorMessage.includes('SignatureDoesNotMatch')) {
+      throw new Error('SignatureDoesNotMatch');
     }
   }
 
   return data;
 }
 
-// 包装函数：签名过期自动重试1次
+// 包装函数：签名错误自动重试1次
 async function submitTask(imageBase64: string, prompt: string, env: Env, retryCount = 1) {
   try {
     return await submitTaskRaw(imageBase64, prompt, env);
   } catch (err) {
     const msg = (err as Error).message;
-    // 识别时间戳过期，重试一次
-    if (msg === 'InvalidTimestamp' && retryCount > 0) {
-      console.log('检测到签名过期，等待2秒后自动重试...');
+    // 识别签名错误，重试一次
+    if ((msg === 'InvalidTimestamp' || msg === 'SignatureDoesNotMatch') && retryCount > 0) {
+      console.log(`检测到${msg}，等待2秒后自动重试...`);
       await new Promise(resolve => setTimeout(resolve, 2000));
       return await submitTask(imageBase64, prompt, env, retryCount - 1);
     }
@@ -275,7 +288,6 @@ async function queryTask(taskId: string, env: Env) {
   };
 
   const xDate = getDateTimeNow();
-  console.log('Query X-Date:', xDate);
 
   const headers: Record<string, string> = {
     'host': VOLC_API_HOST,
@@ -298,9 +310,11 @@ async function queryTask(taskId: string, env: Env) {
   const response = await fetch(`https://${VOLC_API_HOST}/?${queryString}`, {
     method: 'POST',
     headers: {
-      ...headers,
+      'Host': VOLC_API_HOST,
+      'X-Date': xDate,
+      'Content-Type': 'application/json',
       'Authorization': authorization,
-      'Content-Length': encoder.encode(body).length.toString()
+      'X-Volc-Content-Sha256': bodySha
     },
     body: body
   });
@@ -316,23 +330,11 @@ async function queryTask(taskId: string, env: Env) {
   }
 
   if (!response.ok) {
-    const errorCode = data.status || data.code;
-    const errorMessage = data.message || '';
-
-    if (errorCode === 50411 || errorMessage.includes('Risk')) {
-      throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
-    }
-
     throw new Error(`API query failed: ${response.status} ${responseText}`);
   }
 
-  if (data.status && data.status !== 10000) {
-    const errorCode = data.status;
-    const errorMessage = data.message || '';
-
-    if (errorCode === 50411 || errorMessage.includes('Risk')) {
-      throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
-    }
+  if (data.ResponseMetadata?.Error) {
+    throw new Error(`Query error: ${data.ResponseMetadata.Error.Message}`);
   }
 
   return data;
@@ -353,14 +355,7 @@ async function waitForTaskCompletion(taskId: string, env: Env, maxAttempts = 60,
       }
       throw new Error('Task completed but no image data returned');
     } else if (result.data && result.data.status === 'failed') {
-      const errorCode = result.status || result.code;
-      const errorMessage = result.message || 'Unknown error';
-
-      if (errorCode === 50411 || errorMessage.includes('Risk')) {
-        throw new Error(`IMAGE_RISK: 图片未能通过安全检测，请尝试使用其他图片。`);
-      }
-
-      throw new Error(`Task failed: ${errorMessage}`);
+      throw new Error(`Task failed: ${result.message || 'Unknown error'}`);
     }
 
     await new Promise(resolve => setTimeout(resolve, intervalMs));
@@ -395,7 +390,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     console.log('Submitting AI optimization task...');
     console.log('Current UTC time:', new Date().toISOString());
     
-    // 使用带过期重试的包装函数
+    // 使用带签名错误重试的包装函数
     const submitResult = await submitTask(imageBase64, prompt, env);
 
     if (!submitResult.data || !submitResult.data.task_id) {

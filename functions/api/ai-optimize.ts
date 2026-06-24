@@ -96,7 +96,7 @@ function getSignHeaders(originHeaders: Record<string, string>, needSignHeaders?:
   return [signedHeaderKeys, canonicalHeaders];
 }
 
-// 生成火山引擎签名
+// 生成火山引擎V4标准签名【核心修复函数】
 async function generateSignature(
   method: string,
   pathName: string,
@@ -107,7 +107,8 @@ async function generateSignature(
   secretAccessKey: string
 ): Promise<string> {
   const datetime = headers['X-Date'] || headers['x-date'];
-  const date = datetime.substring(0, 8);
+  // 仅提取日期 YYYYMMDD
+  const date = datetime.split('T')[0].replace(/-/g, '');
 
   const [signedHeaders, canonicalHeaders] = getSignHeaders(headers);
   const emptyBodyHash = await sha256('');
@@ -122,7 +123,8 @@ async function generateSignature(
 
   const credentialScope = [date, VOLC_API_REGION, VOLC_API_SERVICE, 'request'].join('/');
   const canonicalRequestHash = await sha256(canonicalRequest);
-  const stringToSign = ['HMAC-SHA256', datetime, credentialScope, canonicalRequestHash].join('\n');
+  // 标准V4前缀 VOLC4-HMAC-SHA256
+  const stringToSign = ['VOLC4-HMAC-SHA256', datetime, credentialScope, canonicalRequestHash].join('\n');
 
   const secretKey = encoder.encode(secretAccessKey);
   const kDate = await hmac(secretKey, date);
@@ -131,18 +133,13 @@ async function generateSignature(
   const kSigning = await hmac(kService, 'request');
   const signature = toHex(await hmac(kSigning, stringToSign));
 
-  return [
-    'HMAC-SHA256',
-    `Credential=${accessKeyId}/${credentialScope},`,
-    `SignedHeaders=${signedHeaders},`,
-    `Signature=${signature}`,
-  ].join(' ');
+  // 修复：删除字段末尾多余逗号，标准鉴权格式
+  return `VOLC4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 }
 
-// 获取当前时间（ISO格式，去掉分隔符）
+// 获取当前标准UTC ISO时间【修复：不再裁剪时间戳】
 function getDateTimeNow(): string {
-  const now = new Date();
-  return now.toISOString().replace(/[:\-]|\.\d{3}/g, '');
+  return new Date().toISOString();
 }
 
 // 提交任务到即梦AI
@@ -171,10 +168,12 @@ async function submitTask(imageBase64: string, prompt: string, env: Env) {
 
   const xDate = getDateTimeNow();
 
+  // 修复：增加强制校验头 X-Volc-Content-Sha256
   const headers: Record<string, string> = {
     'host': VOLC_API_HOST,
     'X-Date': xDate,
-    'content-type': 'application/json'
+    'content-type': 'application/json',
+    'X-Volc-Content-Sha256': bodySha
   };
 
   const authorization = await generateSignature(
@@ -248,10 +247,12 @@ async function queryTask(taskId: string, env: Env) {
 
   const xDate = getDateTimeNow();
 
+  // 修复：增加强制校验头 X-Volc-Content-Sha256
   const headers: Record<string, string> = {
     'host': VOLC_API_HOST,
     'X-Date': xDate,
-    'content-type': 'application/json'
+    'content-type': 'application/json',
+    'X-Volc-Content-Sha256': bodySha
   };
 
   const authorization = await generateSignature(
@@ -356,6 +357,11 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
         { error: 'Missing prompt parameter' },
         { status: 400 }
       );
+    }
+
+    // 前置校验环境变量，防止空密钥HMAC报错
+    if (!env.VOLC_ACCESS_KEY_ID || !env.VOLC_SECRET_ACCESS_KEY) {
+      return Response.json({ error: "VOLC 环境变量未完整配置" }, { status: 500 });
     }
 
     console.log('Submitting AI optimization task...');
